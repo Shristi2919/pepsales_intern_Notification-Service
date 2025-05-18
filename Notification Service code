@@ -1,0 +1,483 @@
+import express from 'express';
+import { createServer } from 'http';
+import { connect } from 'amqplib';
+import { notificationRoutes } from './routes/notification.routes';
+import { NotificationProcessor } from './services/notification.processor';
+import { NotificationService } from './services/notification.service';
+import { connectDb } from './db/connection';
+
+async function bootstrap() {
+  // Initialize Express app
+  const app = express();
+  app.use(express.json());
+  
+  // Connect to database
+  await connectDb();
+  
+  // Connect to RabbitMQ
+  const connection = await connect('amqp://localhost');
+  const channel = await connection.createChannel();
+  
+  // Ensure queue exists
+  await channel.assertQueue('notifications', { durable: true });
+  
+  // Initialize services
+  const notificationService = new NotificationService(channel);
+  const notificationProcessor = new NotificationProcessor(channel);
+  
+  // Setup routes
+  app.use('/api', notificationRoutes(notificationService));
+  
+  // Start notification processing
+  notificationProcessor.startProcessing();
+  
+  // Start server
+  const httpServer = createServer(app);
+  const PORT = process.env.PORT || 3000;
+  
+  httpServer.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+  
+  // Handle graceful shutdown
+  process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    await channel.close();
+    await connection.close();
+    process.exit(0);
+  });
+}
+
+bootstrap().catch(console.error);
+
+// src/models/notification.model.ts
+import mongoose, { Schema, Document } from 'mongoose';
+
+export enum NotificationType {
+  EMAIL = 'email',
+  SMS = 'sms',
+  IN_APP = 'in_app'
+}
+
+export enum NotificationStatus {
+  PENDING = 'pending',
+  SENT = 'sent',
+  FAILED = 'failed'
+}
+
+export interface INotification extends Document {
+  userId: mongoose.Types.ObjectId;
+  type: NotificationType;
+  content: string;
+  subject?: string;
+  status: NotificationStatus;
+  retryCount: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const NotificationSchema: Schema = new Schema({
+  userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { 
+    type: String, 
+    enum: Object.values(NotificationType),
+    required: true 
+  },
+  content: { type: String, required: true },
+  subject: { type: String, required: false },
+  status: { 
+    type: String, 
+    enum: Object.values(NotificationStatus),
+    default: NotificationStatus.PENDING
+  },
+  retryCount: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+export const Notification = mongoose.model<INotification>('Notification', NotificationSchema);
+
+// src/models/user.model.ts
+import mongoose, { Schema, Document } from 'mongoose';
+
+export interface IUser extends Document {
+  email: string;
+  phone?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const UserSchema: Schema = new Schema({
+  email: { type: String, required: true, unique: true },
+  phone: { type: String },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+export const User = mongoose.model<IUser>('User', UserSchema);
+
+// src/routes/notification.routes.ts
+import { Router } from 'express';
+import { NotificationController } from '../controllers/notification.controller';
+import { NotificationService } from '../services/notification.service';
+
+export function notificationRoutes(notificationService: NotificationService): Router {
+  const router = Router();
+  const notificationController = new NotificationController(notificationService);
+
+  // Send a notification
+  router.post('/notifications', notificationController.sendNotification);
+  
+  // Get user notifications
+  router.get('/users/:id/notifications', notificationController.getUserNotifications);
+
+  return router;
+}
+
+// src/controllers/notification.controller.ts
+import { Request, Response } from 'express';
+import { NotificationService } from '../services/notification.service';
+import { NotificationType } from '../models/notification.model';
+import mongoose from 'mongoose';
+
+export class NotificationController {
+  constructor(private notificationService: NotificationService) {}
+
+  sendNotification = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { userId, type, content, subject } = req.body;
+      
+      // Validate request
+      if (!userId || !type || !content) {
+        res.status(400).json({ error: 'Missing required fields: userId, type, content' });
+        return;
+      }
+      
+      // Validate userId is a valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        res.status(400).json({ error: 'Invalid userId format' });
+        return;
+      }
+      
+      // Validate notification type
+      if (!Object.values(NotificationType).includes(type as NotificationType)) {
+        res.status(400).json({ 
+          error: `Invalid notification type. Must be one of: ${Object.values(NotificationType).join(', ')}` 
+        });
+        return;
+      }
+      
+      // Create notification
+      const notification = await this.notificationService.createNotification({
+        userId: new mongoose.Types.ObjectId(userId),
+        type: type as NotificationType,
+        content,
+        subject
+      });
+      
+      res.status(201).json(notification);
+    } catch (error) {
+      console.error('Error sending notification:', error);
+      res.status(500).json({ error: 'Failed to send notification' });
+    }
+  };
+
+  getUserNotifications = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const userId = req.params.id;
+      
+      // Validate userId is a valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(userId)) {
+        res.status(400).json({ error: 'Invalid userId format' });
+        return;
+      }
+      
+      const notifications = await this.notificationService.getUserNotifications(userId);
+      res.status(200).json(notifications);
+    } catch (error) {
+      console.error('Error getting user notifications:', error);
+      res.status(500).json({ error: 'Failed to retrieve notifications' });
+    }
+  };
+}
+
+// src/services/notification.service.ts
+import { Channel } from 'amqplib';
+import mongoose from 'mongoose';
+import { 
+  Notification, 
+  NotificationType, 
+  NotificationStatus,
+  INotification 
+} from '../models/notification.model';
+import { User } from '../models/user.model';
+
+interface CreateNotificationDto {
+  userId: mongoose.Types.ObjectId;
+  type: NotificationType;
+  content: string;
+  subject?: string;
+}
+
+export class NotificationService {
+  constructor(private channel: Channel) {}
+
+  async createNotification(dto: CreateNotificationDto): Promise<INotification> {
+    // First check if user exists
+    const userExists = await User.exists({ _id: dto.userId });
+    if (!userExists) {
+      throw new Error('User not found');
+    }
+    
+    // Create notification in database
+    const notification = await Notification.create({
+      ...dto,
+      status: NotificationStatus.PENDING,
+      retryCount: 0
+    });
+    
+    // Send to queue for processing
+    this.channel.sendToQueue(
+      'notifications',
+      Buffer.from(JSON.stringify({ id: notification._id })),
+      { persistent: true }
+    );
+    
+    return notification;
+  }
+
+  async getUserNotifications(userId: string): Promise<INotification[]> {
+    return Notification.find({ userId: new mongoose.Types.ObjectId(userId) })
+      .sort({ createdAt: -1 });
+  }
+
+  async updateNotificationStatus(
+    id: string, 
+    status: NotificationStatus, 
+    retryCount?: number
+  ): Promise<INotification | null> {
+    const updateData: any = { 
+      status, 
+      updatedAt: new Date() 
+    };
+    
+    if (retryCount !== undefined) {
+      updateData.retryCount = retryCount;
+    }
+    
+    return Notification.findByIdAndUpdate(
+      id, 
+      updateData,
+      { new: true }
+    );
+  }
+}
+
+// src/services/notification.processor.ts
+import { Channel, ConsumeMessage } from 'amqplib';
+import { 
+  Notification, 
+  NotificationType,
+  NotificationStatus
+} from '../models/notification.model';
+import { User } from '../models/user.model';
+import { EmailService } from './email.service';
+import { SmsService } from './sms.service';
+import { InAppService } from './in-app.service';
+
+const MAX_RETRY_COUNT = 3;
+
+export class NotificationProcessor {
+  private emailService: EmailService;
+  private smsService: SmsService;
+  private inAppService: InAppService;
+  
+  constructor(private channel: Channel) {
+    this.emailService = new EmailService();
+    this.smsService = new SmsService();
+    this.inAppService = new InAppService();
+  }
+
+  startProcessing(): void {
+    this.channel.consume('notifications', async (msg) => {
+      if (!msg) return;
+      
+      try {
+        const content = JSON.parse(msg.content.toString());
+        await this.processNotification(content.id);
+        this.channel.ack(msg);
+      } catch (error) {
+        console.error('Error processing notification:', error);
+        this.handleProcessingError(msg, error);
+      }
+    });
+  }
+
+  private async processNotification(notificationId: string): Promise<void> {
+    const notification = await Notification.findById(notificationId);
+    if (!notification) {
+      throw new Error(`Notification not found: ${notificationId}`);
+    }
+    
+    const user = await User.findById(notification.userId);
+    if (!user) {
+      await this.updateNotificationStatus(
+        notification._id.toString(), 
+        NotificationStatus.FAILED
+      );
+      throw new Error(`User not found for notification: ${notificationId}`);
+    }
+
+    try {
+      switch (notification.type) {
+        case NotificationType.EMAIL:
+          if (!user.email) {
+            throw new Error('User has no email address');
+          }
+          await this.emailService.send(user.email, notification.subject || '', notification.content);
+          break;
+          
+        case NotificationType.SMS:
+          if (!user.phone) {
+            throw new Error('User has no phone number');
+          }
+          await this.smsService.send(user.phone, notification.content);
+          break;
+          
+        case NotificationType.IN_APP:
+          await this.inAppService.send(notification.userId.toString(), notification.content);
+          break;
+          
+        default:
+          throw new Error(`Unsupported notification type: ${notification.type}`);
+      }
+      
+      // If we get here, the notification was sent successfully
+      await this.updateNotificationStatus(
+        notification._id.toString(), 
+        NotificationStatus.SENT
+      );
+    } catch (error) {
+      console.error(`Error sending ${notification.type} notification:`, error);
+      
+      // Check if we should retry
+      if (notification.retryCount < MAX_RETRY_COUNT) {
+        await this.scheduleRetry(notification);
+      } else {
+        // Max retries reached, mark as failed
+        await this.updateNotificationStatus(
+          notification._id.toString(), 
+          NotificationStatus.FAILED
+        );
+      }
+      
+      throw error;
+    }
+  }
+
+  private async scheduleRetry(notification: any): Promise<void> {
+    const newRetryCount = notification.retryCount + 1;
+    
+    // Update retry count in database
+    await this.updateNotificationStatus(
+      notification._id.toString(),
+      notification.status,
+      newRetryCount
+    );
+    
+    // Calculate exponential backoff delay (in milliseconds)
+    // 5s, 25s, 125s for retries 1, 2, 3
+    const delayMs = Math.pow(5, newRetryCount) * 1000;
+    
+    // Schedule a retry with exponential backoff
+    setTimeout(() => {
+      this.channel.sendToQueue(
+        'notifications',
+        Buffer.from(JSON.stringify({ id: notification._id })),
+        { persistent: true }
+      );
+    }, delayMs);
+  }
+
+  private async updateNotificationStatus(
+    id: string, 
+    status: NotificationStatus,
+    retryCount?: number
+  ): Promise<void> {
+    const updateData: any = { 
+      status, 
+      updatedAt: new Date() 
+    };
+    
+    if (retryCount !== undefined) {
+      updateData.retryCount = retryCount;
+    }
+    
+    await Notification.findByIdAndUpdate(id, updateData);
+  }
+
+  private handleProcessingError(msg: ConsumeMessage, error: any): void {
+    // Nack the message and don't requeue it, as our retry mechanism
+    // will handle requeuing via the scheduleRetry method
+    this.channel.nack(msg, false, false);
+  }
+}
+
+// src/services/email.service.ts
+export class EmailService {
+  async send(to: string, subject: string, content: string): Promise<void> {
+    // In a real implementation, this would use a service like SendGrid, AWS SES, etc.
+    console.log(`Sending email to ${to}, subject: ${subject}`);
+    
+    // Simulate sending email
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        console.log(`Email sent to ${to}`);
+        resolve();
+      }, 500);
+    });
+  }
+}
+
+// src/services/sms.service.ts
+export class SmsService {
+  async send(to: string, content: string): Promise<void> {
+    // In a real implementation, this would use a service like Twilio, Nexmo, etc.
+    console.log(`Sending SMS to ${to}`);
+    
+    // Simulate sending SMS
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        console.log(`SMS sent to ${to}`);
+        resolve();
+      }, 500);
+    });
+  }
+}
+
+// src/services/in-app.service.ts
+export class InAppService {
+  async send(userId: string, content: string): Promise<void> {
+    // In a real implementation, this might use WebSockets or push notifications
+    console.log(`Sending in-app notification to user ${userId}`);
+    
+    // Simulate sending in-app notification
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        console.log(`In-app notification sent to user ${userId}`);
+        resolve();
+      }, 200);
+    });
+  }
+}
+
+// src/db/connection.ts
+import mongoose from 'mongoose';
+
+export async function connectDb(): Promise<typeof mongoose> {
+  const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/notification-service';
+  
+  return mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000
+  });
+}
